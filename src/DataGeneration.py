@@ -11,6 +11,7 @@ README.md의 프로젝트 제안서에 정의된 Feature 스펙을 기반으로
 import numpy as np
 import pandas as pd
 from pathlib import Path
+from scipy.stats import norm
 
 RANDOM_SEED = 42
 N_TEAM_MEMBERS = 450
@@ -45,13 +46,15 @@ YOY_CHANGE_STD = 6.0
 # Target: 이직의사. 조직문화평가/1Q/2Q 업무몰입도평가 점수의 변동성이 크거나
 # 지속적으로 낮은 사람일수록 이직 위험도(risk_score)가 높아지도록 생성한다.
 # 노이즈를 더해 raw 점수만으로 완전히 역산되지 않도록 한다.
-# risk_score를 동일 빈도 5구간으로 나눠 1(이직 의사 없음)~5(이직 의사 매우 높음)로 라벨링한다.
-EMPLOYMENT_STATUS_LEVELS = 5
+# 사내 분위기를 반영해 소수만 뚜렷한 고위험군으로 갈리도록, 상위 위험도 10%는 5점,
+# 다음 20%(누적 30%)는 4점으로 분류하고, 나머지 70%는 정규분포를 가정해
+# risk_score의 z-score 표준편차 구간(3분위)에 따라 1~3점으로 배분한다.
+TIER5_RATE = 0.10
+TIER4_RATE = 0.30
 AT_RISK_NOISE_STD = 1.0
-AT_RISK_RATE = 0.4
 
-# 위험도 상위 AT_RISK_RATE 비율은 결정적이진 않지만 설문별로 약 40% 확률로 미응답하도록,
-# 응답률 자체를 낮춰서 결측 패턴과 이직의사가 약하게 연동되도록 한다.
+# 위험군(상위 TIER4_RATE 비율, 4~5점)은 결정적이진 않지만 설문별로 약 40% 확률로
+# 미응답하도록, 응답률 자체를 낮춰서 결측 패턴과 이직의사가 약하게 연동되도록 한다.
 AT_RISK_NON_RESPONSE_RATE = 0.4
 
 
@@ -117,12 +120,17 @@ def _generate_yoy_change(n, rng):
     return np.round(rng.normal(YOY_CHANGE_MEAN, YOY_CHANGE_STD, size=n), 1)
 
 
-def _generate_employment_status(raw_100_scores, rng, n_levels=EMPLOYMENT_STATUS_LEVELS, noise_std=AT_RISK_NOISE_STD):
+def _generate_employment_status(raw_100_scores, rng, tier5_rate=TIER5_RATE, tier4_rate=TIER4_RATE,
+                                 noise_std=AT_RISK_NOISE_STD):
     """
     설문 응답(미응답 처리 전) raw 100점 환산 점수를 기준으로 이직의사를 생성한다.
     점수 변동성(표준편차)이 크거나 평균 점수가 지속적으로 낮을수록 위험도(risk_score)가 높아지며,
     여기에 랜덤 노이즈를 더해 raw 점수만으로 완전히 역산되지 않도록 한다.
-    risk_score를 동일 빈도 n_levels 구간으로 나눠 1(이직 의사 없음)~n_levels(매우 높음)로 반환한다.
+
+    사내 분위기를 반영해 소수만 뚜렷한 고위험군으로 갈리도록 상위 위험도 tier5_rate(10%)는
+    5점, 다음 구간(누적 tier4_rate=30%까지)은 4점으로 분류한다. 나머지 다수(70%)는
+    정규분포를 가정하여 risk_score를 재표준화한 z-score의 표준편차 3분위 구간에 따라
+    1(이직 의사 없음)~3점으로 배분한다.
     """
     def _zscore(s):
         return (s - s.mean()) / s.std(ddof=0)
@@ -133,7 +141,24 @@ def _generate_employment_status(raw_100_scores, rng, n_levels=EMPLOYMENT_STATUS_
     risk_score = _zscore(volatility) - _zscore(mean_score)
     risk_score = risk_score + rng.normal(0, noise_std, size=len(raw_100_scores))
 
-    levels = pd.qcut(risk_score, n_levels, labels=range(1, n_levels + 1)).astype(int)
+    tier5_cutoff = risk_score.quantile(1 - tier5_rate)
+    tier4_cutoff = risk_score.quantile(1 - tier4_rate)
+
+    is_tier5 = risk_score >= tier5_cutoff
+    is_tier4 = (risk_score >= tier4_cutoff) & ~is_tier5
+    is_remaining = ~(is_tier5 | is_tier4)
+
+    levels = pd.Series(0, index=risk_score.index, dtype=int)
+    levels[is_tier5] = 5
+    levels[is_tier4] = 4
+
+    # 정규분포 가정: 나머지 70%를 재표준화한 뒤, 정규분포 3분위 경계(±norm.ppf(2/3))로 1~3점 배분
+    remaining_z = _zscore(risk_score[is_remaining])
+    band = norm.ppf(2 / 3)
+
+    levels[is_remaining & (remaining_z > band)] = 1
+    levels[is_remaining & (remaining_z <= band) & (remaining_z > -band)] = 2
+    levels[is_remaining & (remaining_z <= -band)] = 3
 
     return levels, risk_score
 
@@ -173,8 +198,8 @@ def generate_dataset(n_samples: int = N_TEAM_MEMBERS, seed: int = RANDOM_SEED) -
     })
     employment_status, risk_score = _generate_employment_status(raw_100_scores, rng)
 
-    # 위험도 상위 AT_RISK_RATE 비율은 설문별 응답률을 낮춰(결정적이지 않게) 결측 패턴과 이직의사를 약하게 연동시킨다.
-    at_risk_cutoff = risk_score.quantile(1 - AT_RISK_RATE)
+    # 위험군(상위 TIER4_RATE 비율, 4~5점)은 설문별 응답률을 낮춰(결정적이지 않게) 결측 패턴과 이직의사를 약하게 연동시킨다.
+    at_risk_cutoff = risk_score.quantile(1 - TIER4_RATE)
     at_risk_mask = risk_score >= at_risk_cutoff
     at_risk_response_rate = 1 - AT_RISK_NON_RESPONSE_RATE
     org_response_rate = np.where(at_risk_mask, at_risk_response_rate, ORG_CULTURE_RESPONSE_RATE)
