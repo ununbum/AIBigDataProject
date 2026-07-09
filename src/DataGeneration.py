@@ -42,16 +42,16 @@ ENGAGEMENT_RESPONSE_RATE = 0.5
 YOY_CHANGE_MEAN = -3.0
 YOY_CHANGE_STD = 6.0
 
-# Target: 재직상태. 조직문화평가/1Q/2Q 업무몰입도평가 점수의 변동성이 크거나
-# 지속적으로 낮은 사람일수록 '변동'(퇴직, 조직변경, 휴직 등)일 확률이 높아지도록 생성한다.
+# Target: 이직의사. 조직문화평가/1Q/2Q 업무몰입도평가 점수의 변동성이 크거나
+# 지속적으로 낮은 사람일수록 이직 위험도(risk_score)가 높아지도록 생성한다.
 # 노이즈를 더해 raw 점수만으로 완전히 역산되지 않도록 한다.
-EMPLOYMENT_STATUS_STABLE = "의사 있음"
-EMPLOYMENT_STATUS_CHANGED = "의사 없음"
-AT_RISK_RATE = 0.4
+# risk_score를 동일 빈도 5구간으로 나눠 1(이직 의사 없음)~5(이직 의사 매우 높음)로 라벨링한다.
+EMPLOYMENT_STATUS_LEVELS = 5
 AT_RISK_NOISE_STD = 1.0
+AT_RISK_RATE = 0.4
 
-# 위험군('변동')은 결정적이진 않지만 설문별로 약 40% 확률로 미응답하도록,
-# 응답률 자체를 낮춰서 결측 패턴과 재직상태가 약하게 연동되도록 한다.
+# 위험도 상위 AT_RISK_RATE 비율은 결정적이진 않지만 설문별로 약 40% 확률로 미응답하도록,
+# 응답률 자체를 낮춰서 결측 패턴과 이직의사가 약하게 연동되도록 한다.
 AT_RISK_NON_RESPONSE_RATE = 0.4
 
 
@@ -117,12 +117,12 @@ def _generate_yoy_change(n, rng):
     return np.round(rng.normal(YOY_CHANGE_MEAN, YOY_CHANGE_STD, size=n), 1)
 
 
-def _generate_employment_status(raw_100_scores, rng, target_rate=AT_RISK_RATE, noise_std=AT_RISK_NOISE_STD):
+def _generate_employment_status(raw_100_scores, rng, n_levels=EMPLOYMENT_STATUS_LEVELS, noise_std=AT_RISK_NOISE_STD):
     """
-    설문 응답(미응답 처리 전) raw 100점 환산 점수를 기준으로 재직상태를 생성한다.
-    점수 변동성(표준편차)이 크거나 평균 점수가 지속적으로 낮을수록 위험도가 높아지며,
+    설문 응답(미응답 처리 전) raw 100점 환산 점수를 기준으로 이직의사를 생성한다.
+    점수 변동성(표준편차)이 크거나 평균 점수가 지속적으로 낮을수록 위험도(risk_score)가 높아지며,
     여기에 랜덤 노이즈를 더해 raw 점수만으로 완전히 역산되지 않도록 한다.
-    위험도 상위 target_rate 비율만 '변동'으로 분류한다.
+    risk_score를 동일 빈도 n_levels 구간으로 나눠 1(이직 의사 없음)~n_levels(매우 높음)로 반환한다.
     """
     def _zscore(s):
         return (s - s.mean()) / s.std(ddof=0)
@@ -133,10 +133,9 @@ def _generate_employment_status(raw_100_scores, rng, target_rate=AT_RISK_RATE, n
     risk_score = _zscore(volatility) - _zscore(mean_score)
     risk_score = risk_score + rng.normal(0, noise_std, size=len(raw_100_scores))
 
-    cutoff = risk_score.quantile(1 - target_rate)
-    is_at_risk = risk_score >= cutoff
+    levels = pd.qcut(risk_score, n_levels, labels=range(1, n_levels + 1)).astype(int)
 
-    return np.where(is_at_risk, EMPLOYMENT_STATUS_CHANGED, EMPLOYMENT_STATUS_STABLE)
+    return levels, risk_score
 
 
 def generate_dataset(n_samples: int = N_TEAM_MEMBERS, seed: int = RANDOM_SEED) -> pd.DataFrame:
@@ -172,10 +171,11 @@ def generate_dataset(n_samples: int = N_TEAM_MEMBERS, seed: int = RANDOM_SEED) -
         "1Q": engagement_raw_100["1Q"],
         "2Q": engagement_raw_100["2Q"],
     })
-    employment_status = _generate_employment_status(raw_100_scores, rng)
+    employment_status, risk_score = _generate_employment_status(raw_100_scores, rng)
 
-    # 위험군('변동')은 설문별 응답률을 낮춰(결정적이지 않게) 결측 패턴과 재직상태를 약하게 연동시킨다.
-    at_risk_mask = employment_status == EMPLOYMENT_STATUS_CHANGED
+    # 위험도 상위 AT_RISK_RATE 비율은 설문별 응답률을 낮춰(결정적이지 않게) 결측 패턴과 이직의사를 약하게 연동시킨다.
+    at_risk_cutoff = risk_score.quantile(1 - AT_RISK_RATE)
+    at_risk_mask = risk_score >= at_risk_cutoff
     at_risk_response_rate = 1 - AT_RISK_NON_RESPONSE_RATE
     org_response_rate = np.where(at_risk_mask, at_risk_response_rate, ORG_CULTURE_RESPONSE_RATE)
     engagement_response_rate = np.where(at_risk_mask, at_risk_response_rate, ENGAGEMENT_RESPONSE_RATE)
